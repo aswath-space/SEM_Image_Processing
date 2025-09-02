@@ -156,6 +156,56 @@ def _find_scale_bar_component(bin_roi: np.ndarray, expected_px: float | None, mi
             best.update({"found": True, "width": float(width), "bbox": (int(minr), int(minc), int(maxr), int(maxc)), "score": float(score)})
     return best
 
+def _find_tick_train_span(bin_roi: np.ndarray, expected_px: float | None, min_aspect: int) -> Dict[str, Any]:
+    """
+    Detect a scale made of many short vertical ticks:
+    - Take the bottom half of ROI (ticks sit on the baseline)
+    - Strong horizontal dilation to connect the separated ticks
+    - Light erosion to reduce blobs
+    - Choose the widest near-horizontal component, score by closeness to expected_px
+    Returns: {found, width, bbox, score} in ROI coordinates (not full image).
+    """
+    H, W = bin_roi.shape
+    sub_top = int(0.5 * H)
+    sub = bin_roi[sub_top:, :].copy()
+
+    # Connect isolated ticks into one horizontal band
+    kx = max(25, W // 16)     # ~6–8% of ROI width
+    sub = morphology.binary_dilation(sub, footprint=morphology.rectangle(3, kx))
+    sub = morphology.binary_erosion(sub,  footprint=morphology.rectangle(3, 5))
+
+    best: Dict[str, Any] = {"found": False, "width": None, "bbox": None, "score": None}
+    lab = measure.label(sub)
+    for p in measure.regionprops(lab):
+        minr, minc, maxr, maxc = p.bbox
+        height = maxr - minr
+        width  = maxc - minc
+        if width < 20 or height < 2:
+            continue
+        aspect = width / max(height, 1e-6)
+        if aspect < min_aspect:
+            continue
+
+        # Prefer right half (most UIs draw the scale at bottom-right); not mandatory.
+        x_center = (minc + maxc) / 2.0
+        bias = 0.0 if x_center > (0.45 * W) else 0.1
+
+        if expected_px and expected_px > 0:
+            closeness = abs(width - expected_px) / expected_px
+        else:
+            closeness = 1.0 / (1.0 + width)
+
+        score = closeness + bias
+        if (not best["found"]) or (score < best["score"]):
+            # Map bbox back to ROI coords
+            best = {
+                "found": True,
+                "width": float(width),
+                "bbox": (int(minr + sub_top), int(minc), int(maxr + sub_top), int(maxc)),
+                "score": float(score),
+            }
+    return best
+
 
 def run_deep_qc_scale_bar(
     gray01: np.ndarray,
@@ -165,19 +215,11 @@ def run_deep_qc_scale_bar(
     min_aspect: int = 12,
 ) -> Dict[str, Any]:
     """
-    Detect the scale bar near the bottom of the image, measure its pixel length,
-    and compare to expected length from MicronMarker/PixelSize.
-
-    Returns dict:
-      - found (bool)
-      - expected_px (float|None)
-      - measured_px (float|None)
-      - error_pct (float|None)
-      - overlay (H,W,3) uint8 RGB, green box drawn around detected bar (if any)
+    Detect the scale (solid bar or tick-train) near the bottom and compare to MicronMarker/PixelSize.
+    Returns an RGB overlay for Streamlit.
     """
     H, W = gray01.shape
     base_overlay = (gray01 * 255).astype(np.uint8)
-    # Build RGB overlay for Streamlit (consistent color semantics)
     overlay = cv2.cvtColor(base_overlay, cv2.COLOR_GRAY2RGB)
 
     expected_px = None
@@ -188,30 +230,40 @@ def run_deep_qc_scale_bar(
     roi, top = _detect_scale_bar_roi(gray01, roi_bottom_pct)
     roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
 
-    best: Dict[str, Any] = {"found": False}
-    # Try both polarities (white/black bars)
+    best: Dict[str, Any] = {"found": False, "score": 1e9}
+
+    # Try both polarities and both models (solid bar + tick-train)
     for polarity in ("white", "black"):
         work = roi_blur if polarity == "white" else 1.0 - roi_blur
         thr = filters.threshold_otsu(work)
         bin_roi = work > thr
-        # Morphology that favors long horizontal rectangles
-        bin_roi = morphology.binary_closing(bin_roi, footprint=morphology.rectangle(3, 25))
-        bin_roi = morphology.binary_opening(bin_roi, footprint=morphology.rectangle(3, 7))
-        candidate = _find_scale_bar_component(bin_roi, expected_px=expected_px, min_aspect=min_aspect)
-        if candidate["found"] and (not best.get("found") or candidate["score"] < best.get("score", 1e9)):
-            best = candidate
+
+        # --- solid bar model ---
+        bin_bar = morphology.binary_closing(bin_roi, footprint=morphology.rectangle(3, 25))
+        bin_bar = morphology.binary_opening(bin_bar, footprint=morphology.rectangle(3, 7))
+        cand_bar = _find_scale_bar_component(bin_bar, expected_px=expected_px, min_aspect=min_aspect)
+        if cand_bar.get("found") and cand_bar["score"] < best["score"]:
+            cand_bar["model"] = "solid"
+            best = cand_bar
+
+        # --- tick-train model ---
+        cand_tick = _find_tick_train_span(bin_roi, expected_px=expected_px, min_aspect=min_aspect)
+        if cand_tick.get("found") and cand_tick["score"] < best["score"]:
+            cand_tick["model"] = "ticks"
+            best = cand_tick
 
     report: Dict[str, Any] = {"found": False, "expected_px": expected_px, "measured_px": None, "error_pct": None, "overlay": overlay}
+
     if best.get("found"):
         minr, minc, maxr, maxc = best["bbox"]
-        # Draw bbox on overlay in full-coordinates (green)
-        # Note: (0,255,0) is green whether you think in RGB or BGR (G-only channel).
+        # Draw bbox in full-image coordinates
         cv2.rectangle(overlay, (minc, top + minr), (maxc, top + maxr), (0, 255, 0), 2)
         report["found"] = True
         report["measured_px"] = float(best["width"])
         if expected_px:
             report["error_pct"] = abs(best["width"] - expected_px) / expected_px * 100.0
         report["overlay"] = overlay
+
     return report
 
 
@@ -342,3 +394,4 @@ def make_size_overlay(
     blended = (1 - alpha) * base + alpha * colored
     overlay_rgb = (blended * 255).astype(np.uint8)
     return overlay_rgb, vmin, vmax
+
