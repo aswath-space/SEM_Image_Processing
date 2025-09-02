@@ -55,12 +55,20 @@ def _cached_parse_metadata(meta_text: str):
     return parse_metadata(meta_text)
 
 @st.cache_data(show_spinner=False)
-def _cached_preprocess(img_bytes: bytes):
-    # decode → grayscale float → preprocess to [0,1]
+def _cached_decode_and_preprocess(img_bytes: bytes):
+    """
+    Returns:
+      raw01 : raw grayscale normalized to [0,1] (best for Deep-QC of overlays/text)
+      x     : preprocessed grayscale [0,1] (CLAHE + bilateral), for segmentation/overlay
+      shape : (H, W)
+    """
     img_gray, shape = read_image_gray_float(img_bytes)
-    x = preprocess_gray(img_gray)
+    # RAW (0..1) for scale bar detection — avoid CLAHE artifacts
     raw01 = (img_gray - img_gray.min()) / max(1e-6, (img_gray.max() - img_gray.min()))
-    return x, shape
+    # Preprocessed for grain segmentation
+    x = preprocess_gray(img_gray)
+    return raw01, x, shape
+
 
 @st.cache_data(show_spinner=False)
 def _cached_deep_qc(gray01: np.ndarray, px_um: float, micron_marker_um, roi_bottom_pct: int, min_aspect: int):
@@ -121,7 +129,7 @@ except Exception as e:
 
 try:
     img_bytes = _read_uploaded_bytes(img_file)
-    x, (h, w) = _cached_preprocess(img_bytes)  # x is preprocessed grayscale [0,1]
+    raw01, x, (h, w) = _cached_decode_and_preprocess(img_bytes)
 except Exception as e:
     st.error(f"Image read/preprocess error: {e}")
     st.stop()
