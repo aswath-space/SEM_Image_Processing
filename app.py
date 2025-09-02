@@ -27,8 +27,11 @@ from semx.grains import (
 st.set_page_config(page_title="SEM Grain Analyzer", layout="wide")
 st.title("🔬 SEM Grain Size Analyzer — Stage 1")
 
-# Optional: quiet a pyplot deprecation warning in some Streamlit versions
-st.set_option("deprecation.showPyplotGlobalUse", False)
+try:
+    st.set_option("deprecation.showPyplotGlobalUse", False)
+except Exception:
+    # Option was removed in newer Streamlit; safe to ignore.
+    pass
 
 # ---------- Small helpers ----------
 
