@@ -1,3 +1,9 @@
+# app.py — Refactored for Streamlit Cloud / GitHub
+# -----------------------------------------------
+# - Lean UI that delegates core logic to semx/grains.py
+# - Caching for repeat runs on the same inputs
+# - Clear comments, defensive guards, and robust downloads
+
 import io
 from pathlib import Path
 
@@ -17,10 +23,53 @@ from semx.grains import (
     make_size_overlay,
 )
 
+# ---------- Page config ----------
 st.set_page_config(page_title="SEM Grain Analyzer", layout="wide")
-st.title("🔬 SEM Grain Size Analyzer — Stage 1 (GitHub/Cloud)")
+st.title("🔬 SEM Grain Size Analyzer — Stage 1")
 
-# ---------- Sidebar: QC + segmentation + overlay ----------
+# Optional: quiet a pyplot deprecation warning in some Streamlit versions
+st.set_option("deprecation.showPyplotGlobalUse", False)
+
+# ---------- Small helpers ----------
+
+def _nice_metric_name(col: str) -> str:
+    return {
+        "equiv_diam_um": "Equivalent diameter",
+        "major_axis_um": "Major axis length",
+        "minor_axis_um": "Minor axis length",
+        "aspect_ratio": "Aspect ratio",
+    }.get(col, col)
+
+def _metric_unit(col: str) -> str:
+    return "µm" if col != "aspect_ratio" else "a.u."
+
+def _read_uploaded_bytes(uploaded_file) -> bytes:
+    # In Streamlit, getvalue() is reliable and avoids pointer issues of .read()/seek()
+    return uploaded_file.getvalue()
+
+@st.cache_data(show_spinner=False)
+def _cached_parse_metadata(meta_text: str):
+    return parse_metadata(meta_text)
+
+@st.cache_data(show_spinner=False)
+def _cached_preprocess(img_bytes: bytes):
+    # decode → grayscale float → preprocess to [0,1]
+    img_gray, shape = read_image_gray_float(img_bytes)
+    x = preprocess_gray(img_gray)
+    return x, shape
+
+@st.cache_data(show_spinner=False)
+def _cached_deep_qc(gray01: np.ndarray, px_um: float, micron_marker_um, roi_bottom_pct: int, min_aspect: int):
+    # Note: numpy arrays are not hashable by default; Streamlit caches them by value
+    return run_deep_qc_scale_bar(
+        gray01=gray01,
+        px_um=px_um,
+        micron_marker_um=micron_marker_um,
+        roi_bottom_pct=roi_bottom_pct,
+        min_aspect=min_aspect,
+    )
+
+# ---------- Sidebar controls ----------
 with st.sidebar:
     st.header("Deep QC (Scale Bar)")
     deep_qc_enabled = st.checkbox("Enable Deep QC", value=True)
@@ -51,7 +100,7 @@ with st.sidebar:
 
 # ---------- Uploads ----------
 st.header("1) Upload SEM image + metadata")
-img_file = st.file_uploader("SEM image (.jpg/.jpeg/.png/.tif/.tiff)", type=["jpg","jpeg","png","tif","tiff"])
+img_file = st.file_uploader("SEM image (.jpg/.jpeg/.png/.tif/.tiff)", type=["jpg", "jpeg", "png", "tif", "tiff"])
 meta_file = st.file_uploader("Metadata (.txt)", type=["txt"])
 
 if not img_file or not meta_file:
@@ -59,11 +108,19 @@ if not img_file or not meta_file:
     st.stop()
 
 # ---------- Parse metadata & load image ----------
-meta_txt = meta_file.read().decode(errors="ignore")
-meta = parse_metadata(meta_txt)  # {image_name, data_w, data_h, px_um, micron_marker_um}
+try:
+    meta_text = meta_file.read().decode(errors="ignore")
+    meta = _cached_parse_metadata(meta_text)  # {image_name, data_w, data_h, px_um, micron_marker_um}
+except Exception as e:
+    st.error(f"Metadata parsing error: {e}")
+    st.stop()
 
-img_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-img_gray, (h, w) = read_image_gray_float(img_bytes)
+try:
+    img_bytes = _read_uploaded_bytes(img_file)
+    x, (h, w) = _cached_preprocess(img_bytes)  # x is preprocessed grayscale [0,1]
+except Exception as e:
+    st.error(f"Image read/preprocess error: {e}")
+    st.stop()
 
 # ---------- Failsafes ----------
 try:
@@ -81,22 +138,22 @@ st.success(
     + (f"  |  Scale bar (metadata): {meta['micron_marker_um']:.3f} µm" if meta.get("micron_marker_um") else "")
 )
 
-# ---------- Preprocess ----------
-x = preprocess_gray(img_gray)  # normalized [0,1], CLAHE, denoise
-
 # ---------- Deep QC (optional) ----------
 if deep_qc_enabled:
-    qc = run_deep_qc_scale_bar(
+    qc = _cached_deep_qc(
         gray01=x,
         px_um=meta["px_um"],
         micron_marker_um=meta.get("micron_marker_um"),
         roi_bottom_pct=qc_roi_bottom_pct,
         min_aspect=qc_min_aspect,
     )
+
     st.subheader("Deep QC — Scale Bar")
     cqc1, cqc2 = st.columns(2)
-    with cqc1: st.image(x, clamp=True, caption="Preprocessed image", use_container_width=True)
-    with cqc2: st.image(qc["overlay"], clamp=True, caption="Detected bar (green box)", use_container_width=True)
+    with cqc1:
+        st.image(x, clamp=True, caption="Preprocessed image", use_container_width=True)
+    with cqc2:
+        st.image(qc["overlay"], clamp=True, caption="Detected bar (green box)", use_container_width=True)
 
     if qc["found"]:
         st.metric("Expected length (px)", f"{qc['expected_px']:.1f}")
@@ -104,7 +161,9 @@ if deep_qc_enabled:
         if qc["error_pct"] is not None:
             st.metric("Scale-bar error (%)", f"{qc['error_pct']:.2f}%")
             if block_on_qc_fail and qc["error_pct"] > qc_error_threshold_pct:
-                st.error(f"❌ Deep QC failed: {qc['error_pct']:.2f}% > {qc_error_threshold_pct:.2f}% — Blocking.")
+                st.error(
+                    f"❌ Deep QC failed: {qc['error_pct']:.2f}% > {qc_error_threshold_pct:.2f}% — Blocking."
+                )
                 st.stop()
     else:
         if block_on_qc_fail:
@@ -113,36 +172,48 @@ if deep_qc_enabled:
         else:
             st.warning("⚠️ Deep QC could not detect a scale bar — Proceeding per your settings.")
 
+# Choose legend mask; if Deep QC is off, don’t force QC ROI
+legend_mask_pct = max(mask_bottom_pct, qc_roi_bottom_pct) if deep_qc_enabled else mask_bottom_pct
+
 # ---------- Segmentation & measurement ----------
-labels = segment_grains(
-    gray01=x,
-    mask_bottom_pct=max(mask_bottom_pct, qc_roi_bottom_pct),
-    min_area_px=min_area_px,
-    hole_area_px=hole_area_px,
-    h_prominence=h_prominence,
-)
-df = measure_grains(labels=labels, px_um=meta["px_um"], min_area_px=min_area_px)
+try:
+    labels = segment_grains(
+        gray01=x,
+        mask_bottom_pct=legend_mask_pct,
+        min_area_px=min_area_px,
+        hole_area_px=hole_area_px,
+        h_prominence=h_prominence,
+    )
+    df = measure_grains(labels=labels, px_um=meta["px_um"], min_area_px=min_area_px)
+except Exception as e:
+    st.error(f"Segmentation/measurement error: {e}")
+    st.stop()
 
 # ---------- Overlay ----------
-overlay_rgb, vmin, vmax = make_size_overlay(
-    gray01=x,
-    labels=labels,
-    df=df,
-    metric=overlay_metric,
-    p_lo=clip_lo,
-    p_hi=clip_hi,
-    alpha=overlay_alpha,
-)
+try:
+    overlay_rgb, vmin, vmax = make_size_overlay(
+        gray01=x,
+        labels=labels,
+        df=df,
+        metric=overlay_metric,
+        p_lo=clip_lo,
+        p_hi=clip_hi,
+        alpha=overlay_alpha,
+    )
+except Exception as e:
+    st.error(f"Overlay error: {e}")
+    st.stop()
 
+# ---------- Results UI ----------
 st.header("2) Results")
 c1, c2 = st.columns(2)
 with c1:
     st.caption("Preprocessed (contrast-enhanced)")
     st.image(x, clamp=True, use_container_width=True)
 with c2:
-    st.caption(f"Size overlay: {overlay_metric} (clipped {clip_lo}–{clip_hi}%)")
+    st.caption(f"Size overlay: {_nice_metric_name(overlay_metric)} (clipped {clip_lo}–{clip_hi}%)")
     st.image(overlay_rgb, use_container_width=True)
-st.caption(f"Color scale: vmin={vmin:.4g}  vmax={vmax:.4g}  ({'µm' if overlay_metric!='aspect_ratio' else 'a.u.'})")
+st.caption(f"Color scale: vmin={vmin:.4g}  vmax={vmax:.4g}  ({_metric_unit(overlay_metric)})")
 
 st.subheader("Per-grain table (preview)")
 st.dataframe(df.head(12), use_container_width=True)
@@ -153,60 +224,67 @@ if not df.empty:
     st.metric("Mean equiv. diameter (µm)", f"{df['equiv_diam_um'].mean():.3f}")
     st.metric("Median equiv. diameter (µm)", f"{df['equiv_diam_um'].median():.3f}")
 
+    # Per-grain CSV download
+    st.download_button(
+        "⬇️ Download per-grain CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{Path(meta['image_name']).stem}_grains.csv",
+        mime="text/csv",
+    )
+
 # ---------- Plots ----------
 st.subheader("3) Distribution plots")
-if df.empty or overlay_metric not in df.columns:
+if df.empty or overlay_metric not in df.columns or df[overlay_metric].dropna().empty:
     st.info("No data to plot yet. Try adjusting segmentation parameters.")
 else:
     series = df[overlay_metric].dropna().astype(float)
-    unit = "µm" if overlay_metric != "aspect_ratio" else "a.u."
-    nice_name = {
-        "equiv_diam_um": "Equivalent diameter",
-        "major_axis_um": "Major axis length",
-        "minor_axis_um": "Minor axis length",
-        "aspect_ratio": "Aspect ratio",
-    }.get(overlay_metric, overlay_metric)
-    if not series.empty:
-        # Histogram
-        fig_h, ax_h = plt.subplots(figsize=(7, 4), dpi=160)
-        ax_h.hist(series.values, bins=hist_bins, edgecolor="black")
-        ax_h.set_xlabel(f"{nice_name} ({unit})")
-        ax_h.set_ylabel("Count")
-        ax_h.set_title(f"{nice_name} — Histogram")
-        if hist_logy:
-            ax_h.set_yscale("log")
-        mean_v, median_v = float(series.mean()), float(series.median())
-        ax_h.axvline(mean_v, linestyle="--", linewidth=1, label=f"Mean = {mean_v:.3g} {unit}")
-        ax_h.axvline(median_v, linestyle=":",  linewidth=1, label=f"Median = {median_v:.3g} {unit}")
-        ax_h.legend()
-        st.pyplot(fig_h, clear_figure=True)
-        buf_h = io.BytesIO()
-        fig_h.tight_layout(); fig_h.savefig(buf_h, format="png", bbox_inches="tight")
+    nice_name = _nice_metric_name(overlay_metric)
+    unit = _metric_unit(overlay_metric)
+
+    # Histogram
+    fig_h, ax_h = plt.subplots(figsize=(7, 4), dpi=160)
+    ax_h.hist(series.values, bins=hist_bins, edgecolor="black")
+    ax_h.set_xlabel(f"{nice_name} ({unit})")
+    ax_h.set_ylabel("Count")
+    ax_h.set_title(f"{nice_name} — Histogram")
+    if hist_logy:
+        ax_h.set_yscale("log")
+    mean_v, median_v = float(series.mean()), float(series.median())
+    ax_h.axvline(mean_v, linestyle="--", linewidth=1, label=f"Mean = {mean_v:.3g} {unit}")
+    ax_h.axvline(median_v, linestyle=":",  linewidth=1, label=f"Median = {median_v:.3g} {unit}")
+    ax_h.legend()
+    st.pyplot(fig_h, clear_figure=True)
+
+    buf_h = io.BytesIO()
+    fig_h.tight_layout()
+    fig_h.savefig(buf_h, format="png", bbox_inches="tight")
+    st.download_button(
+        "⬇️ Download histogram (PNG)",
+        data=buf_h.getvalue(),
+        file_name=f"{Path(meta['image_name']).stem}_{overlay_metric}_hist.png",
+        mime="image/png",
+    )
+    plt.close(fig_h)
+
+    # Box plot (optional)
+    if show_box:
+        fig_b, ax_b = plt.subplots(figsize=(6, 3.5), dpi=160)
+        ax_b.boxplot(series.values, vert=False, showmeans=True, meanline=True)
+        ax_b.set_xlabel(f"{nice_name} ({unit})")
+        ax_b.set_yticklabels([""])
+        ax_b.set_title(f"{nice_name} — Box plot")
+        st.pyplot(fig_b, clear_figure=True)
+
+        buf_b = io.BytesIO()
+        fig_b.tight_layout()
+        fig_b.savefig(buf_b, format="png", bbox_inches="tight")
         st.download_button(
-            "⬇️ Download histogram (PNG)",
-            data=buf_h.getvalue(),
-            file_name=f"{Path(meta['image_name']).stem}_{overlay_metric}_hist.png",
+            "⬇️ Download box plot (PNG)",
+            data=buf_b.getvalue(),
+            file_name=f"{Path(meta['image_name']).stem}_{overlay_metric}_box.png",
             mime="image/png",
         )
-        plt.close(fig_h)
-
-        # Box plot
-        if show_box:
-            fig_b, ax_b = plt.subplots(figsize=(6, 3.5), dpi=160)
-            ax_b.boxplot(series.values, vert=False, showmeans=True, meanline=True)
-            ax_b.set_xlabel(f"{nice_name} ({unit})")
-            ax_b.set_yticklabels([""])
-            ax_b.set_title(f"{nice_name} — Box plot")
-            st.pyplot(fig_b, clear_figure=True)
-            buf_b = io.BytesIO()
-            fig_b.tight_layout(); fig_b.savefig(buf_b, format="png", bbox_inches="tight")
-            st.download_button(
-                "⬇️ Download box plot (PNG)",
-                data=buf_b.getvalue(),
-                file_name=f"{Path(meta['image_name']).stem}_{overlay_metric}_box.png",
-                mime="image/png",
-            )
-            plt.close(fig_b)
+        plt.close(fig_b)
 
 with st.expander("QC enforced"):
     st.markdown(
@@ -214,5 +292,5 @@ with st.expander("QC enforced"):
         "- **Resolution pairing**: actual pixels must equal `DataSize=` in metadata.\n"
         "- **Scale (Deep QC, optional)**: detect scale bar and compare measured px to `MicronMarker/PixelSize`.\n"
         "- **Legend masking**: bottom strip masked before segmentation to avoid artifacts.\n"
-        "- **Overlay**: robust percentile clipping for stable color mapping."
+        "- **Overlay**: percentile clipping for stable color mapping."
     )
