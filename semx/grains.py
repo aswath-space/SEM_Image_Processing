@@ -10,7 +10,6 @@ Design goals:
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
 from typing import Tuple, Dict, Any
 
 import re
@@ -27,13 +26,12 @@ import matplotlib.pyplot as plt
 def parse_metadata(txt: str) -> Dict[str, Any]:
     """
     Parse SEM metadata text for fields needed by Stage 1.
-    Expected keys:
+    Returns a dict with:
       - image_name (str)
       - data_w, data_h (int)  # DataSize=WxH
       - px_um (float)         # µm / pixel
       - micron_marker_um (float|None)
-
-    Raises: ValueError if any required field is missing.
+    Raises: ValueError if required fields are missing.
     """
     m_img = re.search(r'(?im)^\s*ImageName\s*=\s*(\S+)\s*$', txt)
     if not m_img:
@@ -67,9 +65,10 @@ def parse_metadata(txt: str) -> Dict[str, Any]:
 
 def read_image_gray_float(file_bytes: bytes) -> Tuple[np.ndarray, Tuple[int, int]]:
     """
-    Decode image bytes, return grayscale float32 in [0,1] *after* normalization? No.
-    We return raw grayscale in float32 (0..max) and the (H,W) shape.
-    Normalization is handled by preprocess_gray.
+    Decode image bytes and return:
+      - grayscale float32 array (not normalized, preserves native dynamic range)
+      - (H, W) shape
+    Normalization is handled by preprocess_gray().
     """
     arr = np.frombuffer(file_bytes, np.uint8)
     im = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
@@ -132,12 +131,12 @@ def _detect_scale_bar_roi(gray01: np.ndarray, roi_bottom_pct: int) -> Tuple[np.n
     return gray01[top:H, :].copy(), top
 
 
-def _find_scale_bar_component(bin_roi: np.ndarray, expected_px: float | None, min_aspect: int) -> Dict[str, any]:
+def _find_scale_bar_component(bin_roi: np.ndarray, expected_px: float | None, min_aspect: int) -> Dict[str, Any]:
     """
     Search labeled components for a long, horizontal bar.
     Return best candidate dict: {found, width, bbox, score}
     """
-    best = {"found": False, "width": None, "bbox": None, "score": None}
+    best: Dict[str, Any] = {"found": False, "width": None, "bbox": None, "score": None}
     lab = measure.label(bin_roi)
     for p in measure.regionprops(lab):
         minr, minc, maxr, maxc = p.bbox
@@ -164,7 +163,7 @@ def run_deep_qc_scale_bar(
     micron_marker_um: float | None,
     roi_bottom_pct: int = 16,
     min_aspect: int = 12,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Detect the scale bar near the bottom of the image, measure its pixel length,
     and compare to expected length from MicronMarker/PixelSize.
@@ -174,11 +173,12 @@ def run_deep_qc_scale_bar(
       - expected_px (float|None)
       - measured_px (float|None)
       - error_pct (float|None)
-      - overlay (H,W,3) uint8, green box drawn around detected bar (if any)
+      - overlay (H,W,3) uint8 RGB, green box drawn around detected bar (if any)
     """
     H, W = gray01.shape
     base_overlay = (gray01 * 255).astype(np.uint8)
-    overlay = cv2.cvtColor(base_overlay, cv2.COLOR_GRAY2BGR)
+    # Build RGB overlay for Streamlit (consistent color semantics)
+    overlay = cv2.cvtColor(base_overlay, cv2.COLOR_GRAY2RGB)
 
     expected_px = None
     if micron_marker_um is not None and px_um > 0:
@@ -188,7 +188,7 @@ def run_deep_qc_scale_bar(
     roi, top = _detect_scale_bar_roi(gray01, roi_bottom_pct)
     roi_blur = cv2.GaussianBlur(roi, (3, 3), 0)
 
-    best = {"found": False}
+    best: Dict[str, Any] = {"found": False}
     # Try both polarities (white/black bars)
     for polarity in ("white", "black"):
         work = roi_blur if polarity == "white" else 1.0 - roi_blur
@@ -201,10 +201,11 @@ def run_deep_qc_scale_bar(
         if candidate["found"] and (not best.get("found") or candidate["score"] < best.get("score", 1e9)):
             best = candidate
 
-    report = {"found": False, "expected_px": expected_px, "measured_px": None, "error_pct": None, "overlay": overlay}
+    report: Dict[str, Any] = {"found": False, "expected_px": expected_px, "measured_px": None, "error_pct": None, "overlay": overlay}
     if best.get("found"):
         minr, minc, maxr, maxc = best["bbox"]
-        # Draw bbox on overlay in full-coordinates
+        # Draw bbox on overlay in full-coordinates (green)
+        # Note: (0,255,0) is green whether you think in RGB or BGR (G-only channel).
         cv2.rectangle(overlay, (minc, top + minr), (maxc, top + maxr), (0, 255, 0), 2)
         report["found"] = True
         report["measured_px"] = float(best["width"])
@@ -251,8 +252,15 @@ def segment_grains(
         mask = morphology.remove_small_objects(mask, min_size=int(min_area_px))
 
     dist = ndi.distance_transform_edt(mask)
-    hmax = morphology.h_maxima(dist, h_prominence) if h_prominence > 0 else (dist == dist)
-    markers = measure.label(hmax)
+
+    # h-maxima for peak suppression. If user sets h_prominence <= 0, fall back to
+    # per-component markers so watershed still produces multiple regions.
+    if h_prominence > 0:
+        hmax = morphology.h_maxima(dist, h_prominence)
+        markers = measure.label(hmax)
+    else:
+        markers = measure.label(mask)
+
     labels = segmentation.watershed(-dist, markers, mask=mask)
     return labels
 
@@ -262,11 +270,13 @@ def segment_grains(
 def measure_grains(labels: np.ndarray, px_um: float, min_area_px: int = 80) -> pd.DataFrame:
     """
     Measure per-grain features and convert to physical units.
+    Added: centroids in px and µm for cross-referencing / alignment.
     """
     rows = []
     for p in measure.regionprops(labels):
         if p.area < min_area_px:
             continue
+        cy, cx = p.centroid  # (row=y, col=x) in pixels
         rows.append({
             "label": int(p.label),
             "area_px": int(p.area),
@@ -275,6 +285,10 @@ def measure_grains(labels: np.ndarray, px_um: float, min_area_px: int = 80) -> p
             "minor_axis_um": float(p.minor_axis_length * px_um),
             "aspect_ratio": float(p.major_axis_length / max(p.minor_axis_length, 1e-6)),
             "orientation_rad": float(p.orientation),
+            "centroid_x_px": float(cx),
+            "centroid_y_px": float(cy),
+            "centroid_x_um": float(cx * px_um),
+            "centroid_y_um": float(cy * px_um),
         })
     return pd.DataFrame(rows)
 
@@ -301,7 +315,7 @@ def make_size_overlay(
     size_map = np.zeros((H, W), dtype=np.float32)
 
     if metric not in df.columns:
-        # No data to colorize; return grayscale
+        # No data to colorize; return grayscale RGB
         base = (gray01 * 255).astype(np.uint8)
         return cv2.cvtColor(base, cv2.COLOR_GRAY2RGB), 0.0, 1.0
 
