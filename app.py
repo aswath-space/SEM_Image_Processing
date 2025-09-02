@@ -59,6 +59,7 @@ def _cached_preprocess(img_bytes: bytes):
     # decode → grayscale float → preprocess to [0,1]
     img_gray, shape = read_image_gray_float(img_bytes)
     x = preprocess_gray(img_gray)
+    raw01 = (img_gray - img_gray.min()) / max(1e-6, (img_gray.max() - img_gray.min()))
     return x, shape
 
 @st.cache_data(show_spinner=False)
@@ -144,7 +145,7 @@ st.success(
 # ---------- Deep QC (optional) ----------
 if deep_qc_enabled:
     qc = _cached_deep_qc(
-        gray01=x,
+        gray01=raw01,
         px_um=meta["px_um"],
         micron_marker_um=meta.get("micron_marker_um"),
         roi_bottom_pct=qc_roi_bottom_pct,
