@@ -1,0 +1,22 @@
+# Core scientific stack
+numpy>=1.24
+scipy>=1.11
+pandas>=2.0
+
+# Image processing (headless for Streamlit Cloud)
+opencv-python-headless>=4.8
+scikit-image>=0.21
+Pillow>=10.0
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.12
+
+# Web app
+streamlit>=1.25
+
+# Spectra & future work (safe to keep)
+lmfit>=1.2
+pybaselines>=1.0
+scikit-learn>=1.3
+pywavelets>=1.4
