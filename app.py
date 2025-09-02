@@ -129,7 +129,16 @@ except Exception as e:
 
 try:
     img_bytes = _read_uploaded_bytes(img_file)
-    raw01, x, (h, w) = _cached_decode_and_preprocess(img_bytes)
+
+    # Decode once
+    img_gray, (h, w) = read_image_gray_float(img_bytes)
+
+    # RAW grayscale normalized 0..1 (use this for Deep-QC — better for UI overlays/text)
+    raw01 = (img_gray - img_gray.min()) / max(1e-6, (img_gray.max() - img_gray.min()))
+
+    # Preprocessed image for segmentation/overlay (CLAHE + bilateral)
+    x = preprocess_gray(img_gray)
+
 except Exception as e:
     st.error(f"Image read/preprocess error: {e}")
     st.stop()
